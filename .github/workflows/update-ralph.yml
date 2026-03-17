@@ -1,0 +1,102 @@
+name: Update Ralph formula
+
+on:
+  repository_dispatch:
+    types: [ralph-release]
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new ralph release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST=$(gh api repos/cmoel/ralph/releases/latest --jq '.tag_name' | sed 's/^v//')
+          CURRENT=$(grep '^  version' Formula/ralph.rb | sed 's/.*"\(.*\)".*/\1/')
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update formula
+        if: steps.check.outputs.updated == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.latest }}
+        run: |
+          BASE_URL="https://github.com/cmoel/ralph/releases/download/v${VERSION}"
+          TARGETS=(
+            "aarch64-apple-darwin"
+            "x86_64-apple-darwin"
+            "aarch64-unknown-linux-musl"
+            "x86_64-unknown-linux-musl"
+          )
+
+          declare -A SHAS
+          for target in "${TARGETS[@]}"; do
+            file="ralph-${VERSION}-${target}.tar.gz"
+            curl -sL "${BASE_URL}/${file}" -o "/tmp/${file}"
+            SHAS[$target]=$(sha256sum "/tmp/${file}" | awk '{print $1}')
+          done
+
+          cat > Formula/ralph.rb << FORMULA
+          class Ralph < Formula
+            desc "A TUI for running Ralph loops"
+            homepage "https://github.com/cmoel/ralph"
+            version "${VERSION}"
+            license "MIT"
+
+            if OS.mac? && Hardware::CPU.arm?
+              url "${BASE_URL}/ralph-${VERSION}-aarch64-apple-darwin.tar.gz"
+              sha256 "${SHAS[aarch64-apple-darwin]}"
+            end
+            if OS.mac? && Hardware::CPU.intel?
+              url "${BASE_URL}/ralph-${VERSION}-x86_64-apple-darwin.tar.gz"
+              sha256 "${SHAS[x86_64-apple-darwin]}"
+            end
+            if OS.linux? && Hardware::CPU.arm?
+              url "${BASE_URL}/ralph-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+              sha256 "${SHAS[aarch64-unknown-linux-musl]}"
+            end
+            if OS.linux? && Hardware::CPU.intel?
+              url "${BASE_URL}/ralph-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+              sha256 "${SHAS[x86_64-unknown-linux-musl]}"
+            end
+
+            def install
+              bin.install "ralph"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/ralph --version")
+            end
+          end
+          FORMULA
+
+          # Fix indentation - remove leading spaces from heredoc
+          sed -i 's/^          //' Formula/ralph.rb
+
+      - name: Create pull request
+        if: steps.check.outputs.updated == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.latest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="update-ralph-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Formula/ralph.rb
+          git commit -m "Update ralph to v${VERSION}"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "Update ralph to v${VERSION}" \
+            --body "Automated update of the ralph formula to [v${VERSION}](https://github.com/cmoel/ralph/releases/tag/v${VERSION})."
